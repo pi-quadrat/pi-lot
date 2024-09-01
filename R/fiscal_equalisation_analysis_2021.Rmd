@@ -1,0 +1,523 @@
+---
+title: "Fiscal Equalisation in Germany"
+author: "pi-quadrat"
+date: "2021-07-15"
+output: html_document
+---
+
+```{r Read the data, include=FALSE}
+#Upload the required packages
+library("plm")
+library("rgdal")
+library("maptools")
+library("spdep")
+library("fields")
+library("RColorBrewer")
+library("classInt")
+library("spgwr")
+library("stringr")
+library("dplyr")
+library("corrplot")
+library("ggplot2")
+library("tidyverse")
+library("sf")
+library("tmap")
+library("hrbrthemes")
+library("sp")
+library("openxlsx")
+library("pcse")
+
+#Read the data
+MACRO = read.xlsx("data/equalisation_data.xlsx", 2) #time-serie data
+PANEL = read.xlsx("data/equalisation_data.xlsx", 1) #panel data
+
+```
+
+```{r Transform the data, include=FALSE}
+#The data collected are expressed in current prices, to carry out the analysis, we need to transform the data in constant prices, using the price index with the base year = 2015
+
+#Tranform Macro data from current price to constant price
+MACRO[,5:33] = MACRO[,5:33]/(MACRO[,34]/100)
+
+#Transform Panel data from current price to constant price
+PANEL$price_index_2015 = MACRO$price_index_2015[match(PANEL$year, MACRO$year)]
+PANEL[,5:20] = PANEL[,5:20]/(PANEL[,21]/100)
+
+#Implement panel data style on the panel data
+PANEL = pdata.frame(PANEL, index = c("code", "year"), drop.index = FALSE, row.names = TRUE)
+```
+
+```{r Prepare the data for the analysis, include=FALSE}
+##Prepare macro time serie data
+#Transform the variable in current prices in variables in constant prices (inflation-adjusted)
+
+#Data for descriptive statistics
+MACRO$gdp_capita_west = MACRO$gdp_west/MACRO$population_west
+MACRO$gdp_capita_east = MACRO$gdp_east/MACRO$population_east
+MACRO$amount_redistributed = MACRO$state_vat_equalised + MACRO$amount_lfa + MACRO$general_grant + MACRO$special_grant_pol_costs + MACRO$special_grant_unemployment + MACRO$special_grant_newstates
+MACRO$share_equalisation_gdp = (MACRO$amount_redistributed / MACRO$gdp) * 100
+MACRO$share_equalisation_staterev = (MACRO$amount_redistributed / MACRO$tax_revenue_after_redistribution_equalisation) * 100
+MACRO$share_vat_equalised = (MACRO$state_vat_equalised / MACRO$state_vat)*100
+
+#Prepare panel data to run the model
+#Create the variables required for the model
+
+#State income = Net state income at factor price + State tax revenue before redistribution
+PANEL$state_income = PANEL$net_state_income_factor_prices + PANEL$tax_revenue_bf_redistribution
+#Consumption = State consumption + Private consumption
+PANEL$consumption = PANEL$state_consumption + PANEL$private_consumption
+#Disposable state income after equalisation = Disposable of private households + State tax revenue after redistribution and equalisation
+PANEL$state_dispo_income_1 = PANEL$disposable_income_private_households + PANEL$tax_revenue_after_redistribution_equalisation
+#Disposable state income before equalisation = Disposable of private households + State tax revenue after redistribution and  before equalisation
+PANEL$state_dispo_income_4 = PANEL$disposable_income_private_households + PANEL$tax_revenue_after_redistribution
+#Disposable state income after the first step of equalisation = Disposable state income before equalisation + VAT equalised
+PANEL$state_dispo_income_3 = PANEL$state_dispo_income_4 + PANEL$vat_equalised
+#Disposable state income after the first and second step of equalisation = Disposable state income before the equalisation scheme + VAT equalised + Horizontal transfers
+PANEL$state_dispo_income_2 = PANEL$state_dispo_income_3 + PANEL$lfa
+
+#Transform the data for the model, i.e. transform the figures in relative figures (per capita), and take the first order difference of the log values
+PANEL$d_log_gdp_c = diff(log(PANEL$gdp/PANEL$population), differences = 1)
+PANEL$d_log_si_c = diff(log(PANEL$state_income/PANEL$population), differences = 1)
+PANEL$d_log_dsi1_c = diff(log(PANEL$state_dispo_income_1/PANEL$population), differences = 1)
+PANEL$d_log_dsi2_c = diff(log(PANEL$state_dispo_income_2/PANEL$population), differences = 1)
+PANEL$d_log_dsi3_c = diff(log(PANEL$state_dispo_income_3/PANEL$population), differences = 1)
+PANEL$d_log_dsi4_c = diff(log(PANEL$state_dispo_income_4/PANEL$population), differences = 1)
+PANEL$d_log_c_c = diff(log(PANEL$consumption/PANEL$population), differences = 1)
+
+#Build necessary variables for the extension of the ASY model
+PANEL$tax_rev_VAT = PANEL$tax_revenue_after_redistribution + PANEL$vat_equalised
+PANEL$tax_rev_VAT_H = PANEL$tax_rev_VAT + PANEL$lfa
+
+#Transform the data for the model
+PANEL$d_log_final_tax_rev_c = diff(log(PANEL$tax_revenue_after_redistribution_equalisation/PANEL$population), differences = 1)
+PANEL$d_log_tax_rev_before_eq_c = diff(log(PANEL$tax_revenue_after_redistribution/PANEL$population), differences = 1)
+PANEL$d_log_tax_rev_VAT_c = diff(log(PANEL$tax_rev_VAT/PANEL$population), differences = 1)
+PANEL$d_log_tax_rev_VAT_H_c = diff(log(PANEL$tax_rev_VAT_H/PANEL$population), differences = 1)
+
+```
+
+```{r Prepare maps and data frame for illustrations, include=FALSE}
+#Load the shapefile to create maps
+germany <- readOGR(dsn = "data/DEU_adm1.shp", layer = "DEU_adm1")
+germany@data$VARNAME_1 = c("BW", "BY", "BE", "BB", "HB", "HH", "HE", "MV", "NI", "NW", "RP", "SL", "ST", "SN", "SH", "TH")
+germany@data$OLD = c(1,1,0,0,1,1,1,0,1,1,1,1,0,0,1,0)
+germany@data$NAME_1 = c("Baden-Wurttemberg", "Bavaria", "Berlin", "Brandenburg", "Bremen", "Hamburg", "Hesse", "Mecklenburg-Vorpommern", "Lower Saxony", "North Rhine-Westphalia", "Rhineland-Palatinate", "Saarland", "Saxony-Anhalt", "Saxony", "Schleswig-Holstein", "Thuringia")
+
+#Create data frame to create various graphics
+MACRO$special_grant = MACRO$special_grant_pol_costs + MACRO$special_grant_unemployment + MACRO$special_grant_newstates
+value = c(MACRO$state_vat_equalised, MACRO$amount_lfa, MACRO$general_grant, MACRO$special_grant)
+condition = c(rep("1. State VAT Transfers",14), rep("2. Horizontal Equalisation Transfers", 14), rep("3. General Grant", 14), rep("3. Special Grant", 14))
+year = c(rep(MACRO$year, 4))
+STACKED = data.frame(value, condition, year)
+
+germany@data$MEAN_REV_BF_REDIS_C = round(tapply(PANEL$tax_revenue_bf_redistribution/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_REV_AFTER_REDIS_C = round(tapply(PANEL$tax_revenue_after_redistribution/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_REV_AFTER_REDIS_EQUAL_C = round(tapply(PANEL$tax_revenue_after_redistribution_equalisation/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_VATEQ = round(tapply(PANEL$vat_equalised, PANEL$state, mean))
+germany@data$MEAN_VATEQ_C = round(tapply(PANEL$vat_equalised/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_LFA_CONTRIB_C = ifelse(round(tapply(PANEL$lfa/PANEL$population, PANEL$state, mean)) < 0, -1*round(tapply(PANEL$lfa/PANEL$population, PANEL$state, mean)), 0)
+germany@data$MEAN_LFA_ENDOW_C = ifelse(round(tapply(PANEL$lfa/PANEL$population, PANEL$state, mean)) > 0, round(tapply(PANEL$lfa/PANEL$population, PANEL$state, mean)), 0)
+germany@data$MEAN_GGRANT_C = round(tapply(PANEL$general_grant/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_SGRANT_C = round(tapply((PANEL$special_grant_pol_costs + PANEL$special_grant_unemployment + PANEL$special_grant_newstates)/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_POPULATION = tapply(PANEL$population, PANEL$state, mean)
+germany@data$MEAN_TGRANT = round(tapply(PANEL$total_grants, PANEL$state, mean))
+germany@data$MEAN_TGRANT_C = round(tapply(PANEL$total_grants/PANEL$population, PANEL$state, mean))
+germany@data$MEAN_TOTAL = round(tapply((PANEL$vat_equalised + PANEL$lfa + PANEL$total_grants), PANEL$state, mean))
+germany@data$MEAN_TOTAL_C = round(tapply((PANEL$vat_equalised + PANEL$lfa + PANEL$total_grants)/PANEL$population, PANEL$state, mean))
+
+BAR2015= subset(PANEL, year == 2015)
+germany@data$REV_WTEQ_C_2015 = (BAR2015$tax_revenue_after_redistribution/BAR2015$population)
+germany@data$VAT_CONTRIB_C_2015 = ifelse((BAR2015$vat_equalised/BAR2015$population) < 0, -1*(BAR2015$vat_equalised/BAR2015$population), 0)
+germany@data$VAT_ALLOC_C_2015 = ifelse((BAR2015$vat_equalised/BAR2015$population) > 0, (BAR2015$lfa/BAR2015$population), 0)
+germany@data$LFA_CONTRIB_C_2015 = ifelse((BAR2015$lfa/BAR2015$population) < 0, -1*(BAR2015$lfa/BAR2015$population), 0)
+germany@data$LFA_ALLOC_C_2015 = ifelse((BAR2015$lfa/BAR2015$population) > 0, (BAR2015$lfa/BAR2015$population), 0)
+germany@data$GGRANT_C_2015 = BAR2015$general_grant/BAR2015$population
+germany@data$SGRANT_C_2015 = (BAR2015$special_grant_pol_costs + BAR2015$special_grant_unemployment + BAR2015$special_grant_newstates)/BAR2015$population
+
+value = c(germany@data$REV_WTEQ_C_2015, germany@data$VAT_ALLOC_C_2015, germany@data$LFA_ALLOC_C_2015, germany@data$GGRANT_C_2015, germany@data$SGRANT_C_2015, germany@data$VAT_CONTRIB_C_2015, germany@data$LFA_CONTRIB_C_2015)
+state = c(rep(germany@data$NAME_1, 7))
+condition = c(rep("Revenue Without Equalisation",16), rep("VAT Complement Received", 16), rep("Horizontal Equalisation Allocation", 16), rep("General Grant", 16), rep("Special Grants", 16), rep("VAT Contribution", 16),rep("Horizontal Equalisation Contribution", 16))
+BAR2015 = data.frame(value, condition, state)
+
+```
+
+```{r Aesthetic parameters, include=FALSE}
+#Choice of colors for the maps
+col_west = "#9FCAEC"
+col_east = "#FAE57A"
+
+#Palette of colors for the maps
+palette_map = c("#F9DE60", "#FCEEAB", "#C5DFF3", "#98CAEB", "#7BB6E6", "#3691DA", "#2276BB", "#1C6097", "#174F7B")
+
+#Parameter of the map to avoid overlapping labels
+avoid_overlap = c(0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0)
+
+```
+
+
+#1- Executive summary
+
+The present analysis estimates the role of the German fiscal equalisation scheme in the stabilisation of states' consumption against exogenous GDP shocks for the time period 2005-2018. The study quantifies the different channels of risk sharing identified by Asdrubali, Sorensen and Yosha (1996): factor markets, credit markets, and the government sector, and then measures to what extent each step of the fiscal equalisation scheme contributes to the smoothing of states' consumption. Furthermore, a variation of the so-called "ASY model" is developed to assess the contribution of fiscal equalisation in the smoothing of states fiscal resources in Germany.
+The results obtained are mostly in line with the study of Hepp and Van Hagen (2013), which is here replicated, with the government sector smoothing 15.4% of GDP shocks, including 4.3% smoothed through the fiscal equalisation scheme.
+
+
+#2- Descriptive statistics
+##2.1. Definition of the variables
+
+Key variables:
+
+* state VAT transfers = difference between state VAT a state would receive if state v+VAT was disctributed according to the population principle and the VAT they receive as a result of fiscal redistribution between states and Federation and fiscal equalisation among the states (first stage of fiscal equalisation)
+* net horizontal transfers = allocation or payment proceded as a result of the second stage of fiscal equalisation.
+* federal grants = grants received by states from the central government (third step of fiscal equalisation).
+
+Necessary variables to run the model:
+
+* gdp = states annual GDP per capita in constant price (base year = 2015)
+* state income (si) = sum of net state income  at  factor  prices  and  all  tax  revenues  collected  in  the  state (federal, state and local taxes, plus the joint-taes shared between different levels of government) per capita.
+* consumption = sum of real private and public consumption in the state per capita.
+* disposable state income (dsi)
+
+With different definitions of disposable state income (dsi):
+
+* dsi4 = disposable income of private households plus tax revenue of the state after the redistribution of taxes between states and federation but before the fiscal equalization mechanism.
+* dsi3 = disposable income of private households plus tax revenue of the the state after the redistribution and the first step of fiscal equlisation (VAT sharing).
+* dsi2 = disposable income of private households plus tax revenue of the the state after the redistribution and the first and second steps of fiscal equlisation (VAT sharing + horizontal transfers).
+* dsi1 = disposable income of private households plus tax revenue of the the state after the redistribution and equlisation (VAT sharing, horizontal transfers and federal grants).
+
+Definition of old and new German states
+```{r Map of German States}
+#Map of German States
+germany@data$COL = ifelse(germany@data$OLD == 1, col_west, col_east)
+tm_shape(germany) + tm_fill("COL") + tm_borders("white") + tm_layout(main.title = "Map of Germany Federal States", main.title.size = 1, legend.outside = T) + tm_add_legend(type = c("fill"), title = "Legend:", labels = c('Old German States','New German States'), col = c(col_west, col_east), border.col = "white") + tm_text("NAME_1", size = 0.7, ymod = avoid_overlap)
+
+```
+
+##2.2. National descritive statistics (Weight of fiscal equalisation in Germany)
+###2.2.1. Table of national descriptive statistics
+```{r Table of Descrptive statistics}
+#Table of descriptive statistics: average yearly amounts
+gdp = c(mean(MACRO$gdp), mean(MACRO$gdp_west), mean(MACRO$gdp_east))
+gdp_c = c(mean(MACRO$gdp)/mean(MACRO$population), mean(MACRO$gdp_west)/mean(MACRO$population_west), mean(MACRO$gdp_east)/mean(MACRO$population_east))
+population = c(mean(MACRO$population), mean(MACRO$population_west), mean(MACRO$population_east))
+vat_equalised = c(mean(MACRO$state_vat_equalised), mean(MACRO$state_vat_equalised_west), mean(MACRO$state_vat_equalised_east)) 
+vat_equalised_c = vat_equalised/population
+lfa = c(mean(MACRO$amount_lfa), mean(MACRO$net_lfa_allocation_west), mean(MACRO$net_lfa_allocation_east))
+lfa_c = lfa/population
+grants = c(mean(MACRO$total_grants), mean(MACRO$total_grants_west), mean(MACRO$total_grants_east))
+grants_c = grants/population
+rev_bf_redis = c(mean(MACRO$tax_revenue_bf_redistribution), mean(MACRO$tax_revenue_bf_redistribution_west), mean(MACRO$tax_revenue_bf_redistribution_east))
+rev_bf_redis_c = c(mean(MACRO$tax_revenue_bf_redistribution), mean(MACRO$tax_revenue_bf_redistribution_west), mean(MACRO$tax_revenue_bf_redistribution_east))/population
+rev_after_redis = c(mean(MACRO$tax_revenue_after_redistribution), mean(MACRO$tax_revenue_after_redistribution_west), mean(MACRO$tax_revenue_after_redistribution_east))
+rev_after_redis_c = c(mean(MACRO$tax_revenue_after_redistribution), mean(MACRO$tax_revenue_after_redistribution_west), mean(MACRO$tax_revenue_after_redistribution_east))/population
+rev_after_redis_equal_w_grant = c(mean(MACRO$tax_revenue_after_redistribution_equalisation), mean(MACRO$tax_revenue_after_redistribution_equalisation_west), mean(MACRO$tax_revenue_after_redistribution_equalisation_east))
+rev_after_redis_equal_w_grant_c = c(mean(MACRO$tax_revenue_after_redistribution_equalisation), mean(MACRO$tax_revenue_after_redistribution_equalisation_west), mean(MACRO$tax_revenue_after_redistribution_equalisation_east))/population
+rev_after_redis_equal_wt_grant = rev_after_redis_equal_w_grant - grants
+rev_after_redis_equal_wt_grant_c = rev_after_redis_equal_w_grant_c - grants_c
+
+TABLE_DESSTAT_MACRO = rbind(population, gdp, gdp_c, vat_equalised, vat_equalised_c, lfa, lfa_c, grants, grants_c, rev_bf_redis, rev_bf_redis_c, rev_after_redis, rev_after_redis_c, rev_after_redis_equal_wt_grant, rev_after_redis_equal_wt_grant_c, rev_after_redis_equal_w_grant, rev_after_redis_equal_w_grant_c)
+colnames(TABLE_DESSTAT_MACRO) = c("Total", "Old States", "New States")
+rownames(TABLE_DESSTAT_MACRO) = c("Population (in mil.)", "GDP", "GDP per head", "State VAT Transfers (mil. euros)", "State VAT Transfers per head", "Net Horizontal Transfers (mil. euros)", "Net Horizontal Transfers per head", "Federal Grants (mil. euros)", "Federal Grants per head", "Tax Revenue before Redistribution", "Tax Revenue before Redistribution per head", "Tax Revenue after Redistrib & before Equalisation", "Tax Revenue after Redistrib & before Equalisation per head", "Tax Revenue after Equalisation without Grants", "Tax Revenue after Equalisation without Grants per head", "State Revenue after Equalisation and Grants", "State Revenue after Equalisation and Grants per head")
+round(TABLE_DESSTAT_MACRO, digits = 2)
+
+```
+
+
+###2.2.2. Evolution of fiscal equalisation and relative weight 
+```{r Evolution of fiscal equalisation and relative weight}
+#Stacked graph of the revenue equalised over time
+ggplot(STACKED, aes(x=year, y=value, fill = condition)) + geom_area(alpha=1 , size=1, colour="white") + scale_fill_manual(values = c("#C5DFF3","#7BB6E6","#1C6097", "#174F7B")) + theme_classic() + labs(x="Year", y="Amount in constant million euros (base year = 2015)") + scale_x_continuous(breaks=seq(2005,2019,2))
+
+#Equalisation as share of state tax revenue and GDP
+plot(share_equalisation_gdp ~ year, data = MACRO, xlab="Year" , ylab="Amount of revenue equalised as...", type="b", ylim = c(0,15), col= "#7BB6E6",  lwd=2, pch = 16)
+lines(share_equalisation_staterev~ year, data = MACRO, col= "#2276BB", lwd=2 , type="b", pch = 16)
+legend("topright", legend = c("... % of GDP", "... % of total States tax revenue"),col = c("#7BB6E6","#2276BB"),  pch = c(16,16), bty = "n", pt.cex = 1, cex = 1, text.col = "black", horiz = F , inset = c(0.01, 0.01))
+
+#Share of states VAT used for equalisation purpose
+plot(share_vat_equalised ~ year, data = MACRO, xlab="Year" , ylab="Share of states VAT equalised in %", type="b", ylim = c(0,15), col= "#7BB6E6", lwd=2, pch=16)
+
+```
+
+
+##2.3. States descriptive statistics
+###2.3.1- Tax revenue disparities in Germany
+Map of the tax revenue per capita before/after redistribution and equalisation
+```{r Map of state tax revenue before/after redistribution and equalisation}
+#Map of state tax revenue per capita before redistribution
+tm_shape(germany) + tm_fill("MEAN_REV_BF_REDIS_C",title = "Revenue per capita", palette = palette_map[3:8], style = "fixed", breaks = c(2000, 3500, 5000, 6500, 8000, 10000, 16000)) + tm_borders("white") + tm_layout(main.title = "Average tax revenue per capita before redistribution and equalisation (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_REV_BF_REDIS_C", size = 0.8, ymod = avoid_overlap, col = "black")
+
+#Map of state tax revenue per capita after redistribution
+tm_shape(germany) + tm_fill("MEAN_REV_AFTER_REDIS_C",title = "Revenue per capita", palette = palette_map[3:6], style = "fixed", breaks = c(2000, 3000, 4000, 5000, 6000)) + tm_borders("white") + tm_layout(main.title = "Average tax revenue per capita after redistribution and before equalisation (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_REV_AFTER_REDIS_C", size = 0.8, ymod = avoid_overlap, col = "black")
+
+#Map of state tax revenue per capita after redistribution and equalisation
+tm_shape(germany) + tm_fill("MEAN_REV_AFTER_REDIS_EQUAL_C",title = "Revenue per capita", palette = palette_map[3:6], style = "fixed", breaks = c(2000, 3000, 4000, 5000, 6000)) + tm_borders("white") + tm_layout(main.title = "Average tax revenue per capita after redistribution and equalisation (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_REV_AFTER_REDIS_EQUAL_C", size = 0.8, ymod = avoid_overlap, col = "black")
+
+```
+
+
+###2.3.2- Average State redistribution of VAT (step 1 of fiscal equalisation)
+Map of the average contribution to the first step of the equalisation system (VAT redistribution)
+```{r Average State redistribution of VAT}
+#Map of the average State redistribution of VAT in million euros
+tm_shape(germany) + tm_fill("MEAN_VATEQ",title = "Legend:", palette = palette_map[1:4], style = "fixed", breaks = c(-2500, -1250,0, 1250, 2500)) + tm_borders("white") + tm_layout(main.title = "Average State VAT Transfers (in million euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_VATEQ", size = 0.8, ymod = avoid_overlap)
+
+#Map of the average State redistribution of VAT in million euros per capita
+tm_shape(germany) + tm_fill("MEAN_VATEQ_C",title = "Legend:", palette = palette_map[1:4], style = "fixed", breaks = c(-1000, -500,0, 500, 1000)) + tm_borders("white") + tm_layout(main.title = "Average State VAT Transfers per capita (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_VATEQ_C", size = 0.8, ymod = avoid_overlap)
+
+```
+
+
+###2.3.3- State allocation from the horizontal equalisation system (step 2)
+Map of the average allocation from the equalisation system
+```{r Average State horizontal transfers}
+#Map of the average net allocation from horizontal fiscal equalisation
+germany@data$MEAN_LFA = round(tapply(PANEL$lfa, PANEL$state, mean))
+tm_shape(germany) + tm_fill("MEAN_LFA",title = "Net contribution (allocation - contribution):", palette = palette_map[1:4], style = "fixed", breaks = c(-5000, -2500,0, 2500, 5000)) + tm_borders("white") + tm_layout(main.title = "Average net allocation from horizontal fiscal equalisation (in million euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_LFA", size = 0.8, ymod = avoid_overlap)
+
+#Map of the average net allocation from horizontal fiscal equalisation per capita
+germany@data$MEAN_LFA_C = round((germany@data$MEAN_LFA/germany@data$MEAN_POPULATION), digits = 2)
+tm_shape(germany) + tm_fill("MEAN_LFA_C",title = "Net allocation (allocation - contribution):", palette = palette_map[1:4], style = "fixed", breaks = c(-500, -250,0, 250, 1000)) + tm_borders("white") + tm_layout(main.title = "Average net allocation from horizontal fiscal equalisation per capita (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_LFA_C", size = 0.8, ymod = avoid_overlap)
+
+```
+
+
+###2.3.4- State average grant from central government (step 3)
+Map of the average amount of grant received from central government
+```{r State average grant from central government}
+#Map of the average amount of grant received from central government in million euros
+tm_shape(germany) + tm_fill("MEAN_TGRANT",title = "Legend:", palette = palette_map[3:7], style = "fixed", breaks = c(0,1, 1000, 2000, 3000)) + tm_borders("white") + tm_layout(main.title = "Average grant received (in million euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_TGRANT", size = 0.8, ymod = avoid_overlap)
+
+#Map of the average amount of grant received from central government per capita
+tm_shape(germany) + tm_fill("MEAN_TGRANT_C",title = "Legend:", palette = palette_map[3:7], style = "fixed", breaks = c(0, 1, 100, 250, 500, 800)) + tm_borders("white") + tm_layout(main.title = "Average grant received per capita (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_TGRANT_C", size = 0.8, ymod = avoid_overlap)
+
+```
+
+
+###2.3.5- State average contribution/allocation from the fiscal equalisation mechanism as a whole
+Map of the average amount contribution/allocation to fiscal equalisation
+```{r State average contribution/allocation to fiscal equalisation}
+#Map of the average contribution/allocation to fiscal equalisation in million euros
+tm_shape(germany) + tm_fill("MEAN_TOTAL",title = "Legend:", palette = palette_map[1:4], style = "fixed", breaks = c(-7000,-3500,0, 3500, 7000)) + tm_borders("white") + tm_layout(main.title = "Average contribution/allocation to fiscal equalisation (in million euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_TOTAL", size = 0.8, ymod = avoid_overlap)
+
+#Map of the average contribution/allocation to fiscal equalisation per capita
+tm_shape(germany) + tm_fill("MEAN_TOTAL_C",title = "Legend:", palette = palette_map[1:4], style = "fixed", breaks = c(-2000,-1000,0, 1000, 2000)) + tm_borders("white") + tm_layout(main.title = "Average contribution/allocation to fiscal equalisation per capita (in euros)", main.title.size = 1, legend.outside = T) + tm_text(text = "MEAN_TOTAL_C", size = 0.8, ymod = avoid_overlap)
+
+```
+
+
+#3- Model
+##3.1. ASY Model for Germany 2005-2018 (OLS)
+```{r ASY Model for Germany}
+#First set of regressions (time fixed effect)
+PANEL$Y11 = PANEL$d_log_gdp_c - PANEL$d_log_si_c
+REG_11 = plm(Y11 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_11)
+
+PANEL$Y12 = PANEL$d_log_si_c - PANEL$d_log_dsi1_c
+REG_12 = plm(Y12 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_12)
+
+PANEL$Y13 = PANEL$d_log_dsi1_c - PANEL$d_log_c_c
+REG_13 = plm(Y13 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_13)
+
+PANEL$Y14 = PANEL$d_log_c_c
+REG_14 = plm(Y14 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_14)
+
+#Second set of regressions (time fixed effect)
+REG_21 = plm(Y11 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_21)
+
+PANEL$Y22 = PANEL$d_log_si_c - PANEL$d_log_dsi4_c
+REG_22 = plm(Y22 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_22)
+
+PANEL$Y23 = PANEL$d_log_dsi4_c - PANEL$d_log_dsi1_c
+REG_23 = plm(Y23 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_23)
+
+REG_24 = plm(Y13 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_24)
+
+REG_25 = plm(Y14 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_25)
+
+#Third set of regressions (time fixed effect)
+REG_31 = plm(Y11 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_31)
+
+REG_32 = plm(Y22 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_32)
+
+PANEL$Y33 = PANEL$d_log_dsi4_c - PANEL$d_log_dsi3_c
+REG_33 = plm(Y33 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_33)
+
+PANEL$Y34 = PANEL$d_log_dsi3_c - PANEL$d_log_dsi2_c
+REG_34 = plm(Y34 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_34)
+
+PANEL$Y35 = PANEL$d_log_dsi2_c - PANEL$d_log_dsi1_c
+REG_35 = plm(Y35 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_35)
+
+REG_36 = plm(Y13 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_36)
+
+REG_37 = plm(Y14 ~ d_log_gdp_c, data = PANEL, model="within", effect="time")
+summary(REG_37)
+
+```
+
+
+##3.2. ASY Model Variation: smoothing of states' tax revenue (OLS)
+```{r ASY Model Variation}
+#Regressions
+PANEL$Y1 = PANEL$d_log_tax_rev_before_eq_c - PANEL$d_log_tax_rev_VAT_c
+REG_1 = plm(Y1 ~ d_log_tax_rev_before_eq_c, data = PANEL, model="within", effect="time")
+summary(REG_1)
+
+PANEL$Y2 = PANEL$d_log_tax_rev_VAT_c - PANEL$d_log_tax_rev_VAT_H_c
+REG_2 = plm(Y2 ~ d_log_tax_rev_before_eq_c, data = PANEL, model="within", effect="time")
+summary(REG_2)
+
+PANEL$Y3 = PANEL$d_log_tax_rev_VAT_H_c - PANEL$d_log_final_tax_rev_c
+REG_3 = plm(Y3 ~ d_log_tax_rev_before_eq_c, data = PANEL, model="within", effect="time")
+summary(REG_3)
+
+PANEL$Y4 = PANEL$d_log_final_tax_rev_c
+REG_4 = plm(Y4 ~ d_log_tax_rev_before_eq_c, data = PANEL, model="within", effect="time")
+summary(REG_4)
+
+```
+
+##3.3. ASY Model for Germany 2005-2018 (PCSE)
+```{r ASY model for Germany PCSE}
+PANEL = subset(PANEL, year != 2005) #Droping the year 2005 that is the first year
+
+#First set of regressions
+REG_11_lm = lm(Y11 ~ d_log_gdp_c + as.factor(year), data = PANEL) 
+#The function 'pcse' don't work with something else than a 'lm' estimation. To keep controlling for time and havin time fixed effects, we add each year in the regression using the function 'as.factor()'.
+REG_11_PCSE = pcse(object = REG_11_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_11_PCSE)
+#The same estimator is found for the regressor 'd_log_gdp_c', only the standard error (colomn 'PCSE') changes.
+
+REG_12_lm = lm(Y12 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_12_PCSE = pcse(object = REG_12_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_12_PCSE)
+
+REG_13_lm = lm(Y13 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_13_PCSE = pcse(object = REG_13_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_13_PCSE)
+
+REG_14_lm = lm(Y14 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_14_PCSE = pcse(object = REG_14_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_14_PCSE)
+
+
+#Second set of regressions 
+REG_21_lm = lm(Y11 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_21_PCSE = pcse(object = REG_21_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_21_PCSE)
+
+REG_22_lm = lm(Y22 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_22_PCSE = pcse(object = REG_22_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_22_PCSE)
+
+REG_23_lm = lm(Y23 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_23_PCSE = pcse(object = REG_23_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_23_PCSE)
+
+REG_24_lm = lm(Y13 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_24_PCSE = pcse(object = REG_24_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_24_PCSE)
+
+REG_25_lm = lm(Y14 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_25_PCSE = pcse(object = REG_25_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_25_PCSE)
+
+
+#Third set of regressions
+REG_31_lm = lm(Y11 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_31_PCSE = pcse(object = REG_31_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_31_PCSE)
+
+REG_32_lm = lm(Y22 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_32_PCSE = pcse(object = REG_32_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_32_PCSE)
+
+REG_33_lm = lm(Y33 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_33_PCSE = pcse(object = REG_33_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_33_PCSE)
+
+REG_34_lm = lm(Y34 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_34_PCSE = pcse(object = REG_34_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_34_PCSE)
+
+REG_35_lm = lm(Y35 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_35_PCSE = pcse(object = REG_35_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_35_PCSE)
+
+REG_36_lm = lm(Y13 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_36_PCSE = pcse(object = REG_36_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_36_PCSE)
+
+REG_37_lm = lm(Y14 ~ d_log_gdp_c + as.factor(year), data = PANEL)
+REG_37_PCSE = pcse(object = REG_37_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_37_PCSE)
+
+```
+
+##3.4. ASY Model Variation: smoothing of states' tax revenue (PCSE)
+```{r ASY Model variation PCSE}
+#Regressions
+REG_1_lm = lm(Y1 ~ d_log_tax_rev_before_eq_c + as.factor(year), data = PANEL)
+REG_1_PCSE = pcse(object = REG_1_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_1_PCSE)
+
+REG_2_lm = lm(Y2 ~ d_log_tax_rev_before_eq_c + as.factor(year), data = PANEL)
+REG_2_PCSE = pcse(object = REG_2_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_2_PCSE)
+
+REG_3_lm = lm(Y3 ~ d_log_tax_rev_before_eq_c + as.factor(year), data = PANEL)
+REG_3_PCSE = pcse(object = REG_3_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_3_PCSE)
+
+REG_4_lm = lm(Y4 ~ d_log_tax_rev_before_eq_c + as.factor(year), data = PANEL)
+REG_4_PCSE = pcse(object = REG_4_lm, groupN =  PANEL$code, groupT =  PANEL$year)
+summary.pcse(REG_4_PCSE)
+
+
+```
+
+
+
+#4- Results
+
+The tables underneath just display the coefficient found. The use of a standard OLS method or of a OLS procedure with panel-corrected standard errors delivers the same coefficient, but the standard errors and thus the statistical significance may be slightly different.
+
+##4.1. Smoothing of states' consumption for Germany between 2005 and 2018 
+```{r Table of results for states consumption}
+eq1 = c(coef(REG_11),coef(REG_12), NA, NA, NA,NA,NA,coef(REG_13),coef(REG_14))
+eq2 = c(coef(REG_21),NA, coef(REG_22),coef(REG_23),NA,NA,NA,coef(REG_24),coef(REG_25))
+eq3 = c(coef(REG_31),NA, coef(REG_32),NA,coef(REG_33),coef(REG_34),coef(REG_35),coef(REG_36),coef(REG_37))
+SUM_RESULTS_CONSO = cbind(eq1,eq2,eq3)
+colnames(SUM_RESULTS_CONSO) = c("Set 1", "Set 2", "Set 3")
+rownames(SUM_RESULTS_CONSO) = c("Factor market", "Governement sector overall", "Tax redistribution and social security", "Fiscal equalisation overall", "VAT redistribution", "Horizontal transfers", "Federal grants", "Credit market", "Unsmoothed")
+round(SUM_RESULTS_CONSO, digits = 3)
+
+```
+
+##4.2. Smoothing of states' tax revenue for Germany between 2005 and 2018
+```{r Table of results for states tax revenue}
+SUM_RESULTS_TAXREV = c(coef(REG_1),coef(REG_2),coef(REG_3),coef(REG_4))
+
+SUM_RESULTS_TAXREV = cbind(SUM_RESULTS_TAXREV)
+colnames(SUM_RESULTS_TAXREV) = "% of smoothing"
+rownames(SUM_RESULTS_TAXREV) = c("VAT redistribution", "Horizontal transfers", "Federal grants", "Unsmoothed")
+round(SUM_RESULTS_TAXREV, digits = 3)
+
+```
+
+
+
